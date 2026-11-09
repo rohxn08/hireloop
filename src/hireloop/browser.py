@@ -96,6 +96,8 @@ class Browser:
                         raise BrowserError("The browser profile is already open, probably by "
                                            "hireloop-login. Close that window and try again.") from None
                     raise BrowserError(f"Couldn't start the browser: {msg.splitlines()[0]}") from None
+                # If the window gets closed (by you, or a crash), start a fresh one next time.
+                self._ctx.on("close", lambda _: self._forget())
             pages = self._ctx.pages
             return pages[0] if pages else await self._ctx.new_page()
 
@@ -177,6 +179,11 @@ class Browser:
         await page.mouse.move(x, y, steps=random.randint(12, 30))
         await asyncio.sleep(random.uniform(0.2, 0.7))
         await page.mouse.click(x, y)
+
+    def _forget(self) -> None:
+        pw, self._ctx, self._pw = self._pw, None, None
+        if pw:
+            asyncio.ensure_future(pw.stop())
 
     async def close(self) -> None:
         if self._ctx:
