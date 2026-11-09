@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from wellfound_mcp import config, store
+from hireloop import config, store
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +45,17 @@ def test_limit_hit_resets_ramp():
         c.execute("INSERT INTO limit_hits VALUES (?)", ((date.today() - timedelta(days=2)).isoformat(),))
     submitted_on("c", 1)
     assert store.daily_limit()["limit_today"] == 6          # only the day after the hit counts
+
+
+def test_caps_are_per_site(monkeypatch):
+    monkeypatch.setattr(config, "INDEED_DAILY_START", 10)
+    monkeypatch.setattr(config, "INDEED_DAILY_MAX", 30)
+    store.record("1-a", "submitted")
+    store.record("indeed:0123456789abcdef", "submitted")
+    store.record("indeed:fedcba9876543210", "submitted")
+    assert store.daily_limit("wellfound") == {"submitted_today": 1, "limit_today": 5}
+    assert store.daily_limit("indeed") == {"submitted_today": 2, "limit_today": 10}
+    store.record_limit_hit("indeed")                       # Indeed blocking doesn't touch Wellfound
+    assert store.daily_limit("wellfound")["limit_today"] == 5
+    assert [r["job_id"] for r in store.list_all(site="wellfound")] == ["1-a"]
+    assert len(store.list_all(site="indeed")) == 2

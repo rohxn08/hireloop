@@ -13,8 +13,9 @@ from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 
-from . import config, factcheck, notify, profile, store, wellfound
+from . import config, factcheck, notify, profile, sites, store
 from .browser import Browser, BrowserError
+from .sites import ApplyError, wellfound
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 browser = Browser()
@@ -38,17 +39,21 @@ async def lifespan(_server: FastMCP):
 
 # Workflow guidance lives here once, instead of being repeated in every tool description.
 INSTRUCTIONS = (
-    "Wellfound job applications. Flow: get_profile once; search_jobs; get_job (check fit.ok, "
+    "Job applications on Wellfound and Indeed (search_jobs site=; other tools tell the site from the "
+    "job id; Indeed ids start 'indeed:'; only Indeed jobs with easy_apply can be sent). Flow: get_profile once; search_jobs; get_job (check fit.ok, "
     "skip_job the misfits with the fit reasons); draft_application (questions + description); "
     "write answers ONLY from the profile; fact_check; then submit_application, or "
-    "hold_application if anything fails or you're unsure. Never invent facts. "
+    "hold_application if anything fails or you're unsure. If submit returns new_questions (Indeed's "
+    "later pages), answer them too, fact_check all answers, and submit again. Never invent facts. "
     + ("AUTO MODE ON: the user gave standing permission to submit and skip without asking, but only "
-       "jobs with fit.ok and answers that passed fact_check after your own sentence-by-sentence review."
+       "jobs with fit.ok and answers that passed fact_check after your own sentence-by-sentence review. "
+       + ("" if config.INDEED_AUTO_APPLY else
+          "Except Indeed: show each Indeed submit preview and send only after the user approves it.")
        if config.AUTO_APPLY else
        "Manual mode: show the submit preview and send with confirm=true only after the user approves it; "
        "skip_job also needs the user's OK.")
 )
-mcp = FastMCP("wellfound", instructions=INSTRUCTIONS, lifespan=lifespan)
+mcp = FastMCP("hireloop", instructions=INSTRUCTIONS, lifespan=lifespan)
 
 
 def _lean(x):
@@ -83,28 +88,45 @@ AUTO_SUBMIT_DOC = "Send an application (answers keyed by question key). Auto mod
 MANUAL_SUBMIT_DOC = "Send an application (answers keyed by question key). confirm=false previews; confirm=true only after the user approves that exact preview."
 
 
+def _auto(job_id: str) -> bool:
+    """May this job be sent without asking? Indeed needs its own flag on top of AUTO_APPLY."""
+    return config.INDEED_AUTO_APPLY if sites.name_of(job_id) == "indeed" else config.AUTO_APPLY
+
+
 def _names(job_id: str) -> dict:
     j = seen_jobs.get(job_id) or store.get(job_id) or {}
     return {"title": j.get("title") or "", "company": j.get("company") or ""}
 
 
 def _apply_error(e: Exception, job_id: str) -> dict:
-    out = {"error": str(e), "job_id": job_id, "wellfound_says": getattr(e, "notice", None)}
+    out = {"error": str(e), "job_id": job_id, "site_says": getattr(e, "notice", None),
+           "debug_page": getattr(e, "debug", None)}
     if getattr(e, "limit_reached", False):
-        store.record_limit_hit()
+        store.record_limit_hit(sites.name_of(job_id))
         out["limit_reached"] = True
-        out["next"] = "Stop applying for now and tell the user; slots free up as older applications expire."
+        out["next"] = "Stop applying on this site for now and tell the user; slots free up as older applications expire."
+    if new := getattr(e, "questions", None):
+        # Indeed showed more questions on a later page: add them to the draft.
+        known = {q["key"] for q in drafts.get(job_id, [])}
+        drafts[job_id] = drafts.get(job_id, []) + [q for q in new if q["key"] not in known]
+        checked.pop(job_id, None)
+        out["new_questions"] = new
     return {k: v for k, v in out.items() if v is not None}
 
 
 @tool()
-async def check_login() -> dict:
-    """Is the saved Wellfound session logged in?"""
-    try:
-        ok = await wellfound.is_logged_in(browser)
-    except BrowserError as e:
-        return {"logged_in": None, "error": str(e)}
-    return {"logged_in": ok, "hint": None if ok else "Run `uv run wellfound-mcp-login` and sign in."}
+async def check_login(site: str = "wellfound") -> dict:
+    """Is the saved session logged in? site: wellfound | indeed | all."""
+    names = list(sites.SITES) if site == "all" else [site]
+    out = {}
+    for name in names:
+        try:
+            ok = await sites.get(name).is_logged_in(browser)
+        except (BrowserError, ValueError) as e:
+            out[name] = {"logged_in": None, "error": str(e)}
+            continue
+        out[name] = {"logged_in": ok, "hint": None if ok else f"Run `uv run hireloop-login {name}` and sign in."}
+    return out[names[0]] if len(names) == 1 else out
 
 
 @tool()
@@ -121,11 +143,11 @@ def save_answer(question: str, answer: str) -> dict:
 
 @tool()
 async def search_jobs(role: str, location: str | None = None, remote: bool = False, limit: int = 10,
-                      summaries: bool = False) -> dict:
-    """Search jobs. Hides skipped ones; marks drafted/held/submitted. summaries=true adds a one-line summary per job."""
+                      summaries: bool = False, site: str = "wellfound") -> dict:
+    """Search jobs on a site (wellfound | indeed). Hides skipped ones; marks drafted/held/submitted. summaries=true adds a one-line summary per job."""
     try:
-        rows = await wellfound.search_jobs(browser, role, location, remote, min(limit, 25))
-    except BrowserError as e:
+        rows = await sites.get(site).search_jobs(browser, role, location, remote, min(limit, 25))
+    except (BrowserError, ValueError) as e:
         return {"error": str(e)}
     out, hidden = [], 0
     for r in rows:
@@ -152,6 +174,7 @@ async def _wait_for_scheduled() -> dict | None:
     Returns None when it's fine to send, or an error dict asking to retry later."""
     if not config.WAIT_FOR_SCHEDULED:
         return None
+    # Only Wellfound has the undo window; the caller only asks for Wellfound jobs.
     waited = 0.0
     while True:
         left = await wellfound.scheduled_remaining(browser)
@@ -167,17 +190,21 @@ async def _wait_for_scheduled() -> dict | None:
 
 
 def _job_for_email(job_id: str) -> dict:
-    return {**seen_jobs.get(job_id, {}), **_names(job_id), "id": job_id, "url": f"{config.BASE_URL}/jobs/{job_id}"}
+    site = sites.of(job_id)
+    return {**seen_jobs.get(job_id, {}), **_names(job_id), "id": job_id, "url": site.job_url(job_id),
+            "site": site.LABEL, "applied_url": site.APPLIED_URL}
 
 
 @tool()
 async def get_job(job_id: str, full: bool = False) -> dict:
-    """Job details and fit (rules: <=3 yrs, pay floor, India or visa, applies on Wellfound). full=true adds the description."""
+    """Job details and fit (rules: <=3 yrs, pay floor, India or visa, applies on the site itself). full=true adds the description."""
     try:
-        job = await wellfound.get_job(browser, job_id)
+        job = await sites.of(job_id).get_job(browser, job_id)
     except BrowserError as e:
         return {"error": str(e), "job_id": job_id}
     if "error" not in job:
+        if job.get("applies_on_site") is None and (easy := seen_jobs.get(job_id, {}).get("easy_apply")) is not None:
+            job["applies_on_site"] = easy          # the search card knew; the job page didn't say
         _remember(job_id, job)
         job["fit"] = factcheck.fit(job)          # uses the description, so check before trimming
         if not full:
@@ -212,20 +239,22 @@ async def draft_application(job_id: str) -> dict:
     """Open the apply form: questions (answer by key), warnings, fit and the job description. Sends nothing."""
     if (seen := store.get(job_id)) and seen["status"] == "submitted":
         return {"error": "Already applied to this job.", "on": seen["updated_at"]}
+    site = sites.of(job_id)
     try:
-        form = await wellfound.application_questions(browser, job_id)
-    except (wellfound.ApplyError, BrowserError) as e:
+        form = await site.application_questions(browser, job_id)
+    except (ApplyError, BrowserError) as e:
         return _apply_error(e, job_id)
     job = form.pop("job", None)
+    note = form.pop("note", None) or f"{site.LABEL} sends the user's {site.LABEL} profile with the application; only these questions are filled here."
     if job:
         _remember(job_id, job)
     drafts[job_id] = form["questions"]
     checked.pop(job_id, None)
-    store.record(job_id, "drafted", url=f"{config.BASE_URL}/jobs/{job_id}", **_names(job_id))
+    store.record(job_id, "drafted", url=site.job_url(job_id), **_names(job_id))
     return {"job_id": job_id, **_names(job_id), **form,
             "fit": factcheck.fit(job) if job else None,
             "description": (job or {}).get("description", "")[:1000] or None,
-            "note": "Wellfound sends the user's Wellfound profile with the application; only these questions are filled here."}
+            "note": note}
 
 
 @tool()
@@ -250,7 +279,7 @@ async def hold_application(job_id: str, answers: dict[str, str], reason: str) ->
     """Don't send; log it as held and email the user the draft and reason."""
     questions = drafts.get(job_id, [])
     rows = [{"question": q["question"], "answer": answers.get(q["key"], "")} for q in questions]
-    store.record(job_id, "held", notes=reason, url=f"{config.BASE_URL}/jobs/{job_id}", **_names(job_id))
+    store.record(job_id, "held", notes=reason, url=sites.of(job_id).job_url(job_id), **_names(job_id))
     email = await asyncio.to_thread(notify.application_held, _job_for_email(job_id), rows, reason)
     return {"held": True, "job_id": job_id, **_names(job_id), "email_alert": email}
 
@@ -270,26 +299,28 @@ async def submit_application(job_id: str, answers: dict[str, str], confirm: bool
         return {"preview": True, "job_id": job_id, **_names(job_id), "answers": rows,
                 "missing_required": missing or None, "unknown_keys": unknown or None,
                 "fact_checked": checked.get(job_id) == factcheck.answers_hash(answers),
-                "today": store.daily_limit(),
+                "today": store.daily_limit(sites.name_of(job_id)),
                 "next": ("Auto mode: send only if fact_checked and fit.ok and you're confident; otherwise hold_application."
-                         if config.AUTO_APPLY else
+                         if _auto(job_id) else
                          "Show this to the user. Resubmit with confirm=True only if they approve.")}
     if config.AUTO_APPLY:
-        # The server enforces the auto-mode rules; Claude's judgement is the second check.
+        # The server enforces the auto-mode rules (also for sites still on manual approval);
+        # Claude's judgement is the second check.
         if checked.get(job_id) != factcheck.answers_hash(answers):
             return {"submitted": False, "error": "Auto mode: these exact answers haven't passed fact_check. "
                     "Run fact_check, or hold_application if it can't pass."}
         if not (fit := factcheck.fit(job_cache.get(job_id, {})))["ok"]:
             return {"submitted": False, "error": f"Auto mode: job doesn't fit the rules: {fit['reasons']}. Skip it."}
-    today = store.daily_limit()
+    site = sites.of(job_id)
+    today = store.daily_limit(site.NAME)
     if today["submitted_today"] >= today["limit_today"]:
-        return {"error": f"Today's limit of {today['limit_today']} applications is reached. "
-                         "It rises by 1 each day you apply without Wellfound blocking you.", **today}
+        return {"error": f"Today's limit of {today['limit_today']} {site.LABEL} applications is reached. "
+                         f"It rises by 1 each day you apply without {site.LABEL} blocking you.", **today}
     try:
-        if busy := await _wait_for_scheduled():
+        if site is wellfound and (busy := await _wait_for_scheduled()):
             return {**busy, "job_id": job_id}
-        await wellfound.submit(browser, job_id, answers)
-    except (wellfound.ApplyError, BrowserError) as e:
+        await site.submit(browser, job_id, answers)
+    except (ApplyError, BrowserError) as e:
         return {"submitted": False, **_apply_error(e, job_id)}
     store.record(job_id, "submitted", **_names(job_id))
     checked.pop(job_id, None)
@@ -299,9 +330,9 @@ async def submit_application(job_id: str, answers: dict[str, str], confirm: bool
 
 
 @tool()
-def list_applications(status: str | None = None, limit: int = 50) -> list[dict]:
-    """Local log. status: submitted | held | drafted | skipped."""
-    return store.list_all(status, limit)
+def list_applications(status: str | None = None, limit: int = 50, site: str | None = None) -> list[dict]:
+    """Local log. status: submitted | held | drafted | skipped. site: wellfound | indeed."""
+    return store.list_all(status, limit, site)
 
 
 def main() -> None:

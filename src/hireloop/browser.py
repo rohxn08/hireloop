@@ -3,7 +3,7 @@
 Also the "behave like a person" helpers: random pauses between page loads,
 a little scrolling, typing at human speed, moving the mouse to a button before
 clicking it, retries for page loads, and waiting for you to clear a Cloudflare
-check in the visible window. Submitting is never retried (see wellfound.submit).
+check in the visible window. Submitting is never retried (see the site modules' submit).
 """
 
 import asyncio
@@ -34,9 +34,11 @@ CHALLENGE_WAIT_S = 120
 
 # Wellfound loads Cloudflare Turnstile on every page but only shows its overlay
 # ("One more step before you proceed...") when it wants a check. Cloudflare's
-# full-page check has the title "Just a moment...".
+# full-page check has the title "Just a moment...". Indeed's own check page is
+# titled "Security Check" ("Additional Verification Required").
 CHALLENGE_JS = """() => {
-  if (document.title.startsWith('Just a moment')) return true;
+  const t = document.title;
+  if (t.startsWith('Just a moment') || /security check|verification required/i.test(t)) return true;
   const w = document.getElementById('turnstile_widget');
   const overlay = w && w.parentElement;
   return !!(overlay && getComputedStyle(overlay).display !== 'none');
@@ -89,10 +91,10 @@ class Browser:
                     msg = str(e)
                     if "XServer" in msg or "DISPLAY" in msg:
                         raise BrowserError("Couldn't open the browser window (no display found). Set DISPLAY "
-                                           "for the MCP server, or WELLFOUND_HEADLESS=1 to run hidden.") from None
+                                           "for the MCP server, or HIRELOOP_HEADLESS=1 to run hidden.") from None
                     if "ProcessSingleton" in msg or "profile" in msg.lower() and "in use" in msg.lower():
                         raise BrowserError("The browser profile is already open, probably by "
-                                           "wellfound-mcp-login. Close that window and try again.") from None
+                                           "hireloop-login. Close that window and try again.") from None
                     raise BrowserError(f"Couldn't start the browser: {msg.splitlines()[0]}") from None
             pages = self._ctx.pages
             return pages[0] if pages else await self._ctx.new_page()
@@ -130,15 +132,15 @@ class Browser:
         if not await page.evaluate(CHALLENGE_JS):
             return
         if config.HEADLESS:
-            raise BrowserError("Wellfound is showing a Cloudflare check. Set WELLFOUND_HEADLESS=0 "
+            raise BrowserError("The site is showing a bot check. Set HIRELOOP_HEADLESS=0 "
                                "and clear it in the browser window.")
-        log.warning("Cloudflare check showing; waiting up to %ss for it to be cleared.", CHALLENGE_WAIT_S)
+        log.warning("Bot check showing; waiting up to %ss for you to clear it.", CHALLENGE_WAIT_S)
         for _ in range(CHALLENGE_WAIT_S // 2):
             await asyncio.sleep(2)
             if not await page.evaluate(CHALLENGE_JS):
                 await asyncio.sleep(random.uniform(1, 2))
                 return
-        raise BrowserError("A Cloudflare check is waiting in the browser window. "
+        raise BrowserError("A bot check is waiting in the browser window. "
                            "Clear it there, then try again.")
 
     async def _glance(self, page: Page) -> None:

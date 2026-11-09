@@ -1,6 +1,6 @@
 """Dashboard stats come straight from the local log."""
 
-from wellfound_mcp import config, dashboard, store
+from hireloop import config, dashboard, store
 
 
 def test_stats(tmp_path, monkeypatch):

@@ -3,7 +3,7 @@
 
 import json
 
-from wellfound_mcp import wellfound as w
+from hireloop.sites import wellfound as w
 
 
 def search_page(viewer_user=None) -> str:
@@ -127,13 +127,13 @@ def test_parse_job_logged_in():
     assert j["company"] == "Acme" and j["salary"] == "₹10L – ₹15L"
     assert j["remote_policy"] == "In office" and j["years"] == "3+"
     assert j["visa"] == "Not available" and j["relocation"] == "Allowed"
-    assert j["stack"] == ["Python"] and j["apply_on_wellfound"] is True
+    assert j["stack"] == ["Python"] and j["applies_on_site"] is True
     assert j["eligibility_issues"] is None
     assert j["description"].startswith("About Us")
 
 
 def test_typing_chunks_keep_text_exact():
-    from wellfound_mcp.browser import _chunks
+    from hireloop.browser import _chunks
     text = "Hi  there,\nI build voice agents and RAG systems.   Happy to chat!\n\n- Rohan"
     for _ in range(20):
         parts = _chunks(text)

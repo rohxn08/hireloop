@@ -1,10 +1,10 @@
 """Weekly email report, sent on Sundays by a systemd user timer.
 
-  uv run wellfound-mcp-weekly-report            send this week's report (once per week)
-  uv run wellfound-mcp-weekly-report --dry-run  print it instead of sending
-  uv run wellfound-mcp-weekly-report --force    send even if this week's already went
-  uv run wellfound-mcp-weekly-report --install  set up the Sunday timer
-  uv run wellfound-mcp-weekly-report --uninstall
+  uv run hireloop-weekly-report            send this week's report (once per week)
+  uv run hireloop-weekly-report --dry-run  print it instead of sending
+  uv run hireloop-weekly-report --force    send even if this week's already went
+  uv run hireloop-weekly-report --install  set up the Sunday timer
+  uv run hireloop-weekly-report --uninstall
 
 The timer is Persistent, so if the computer is off on Sunday evening the
 report goes out the next time you log in.
@@ -17,10 +17,13 @@ from datetime import date, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
+from collections import Counter
+
 from . import config, dashboard, notify
 
 SENT_MARKER = "last-weekly-report"  # holds the ISO week last reported, e.g. 2026-W45
-UNIT = "wellfound-weekly-report"
+UNIT = "hireloop-weekly-report"
+OLD_UNIT = "wellfound-weekly-report"   # the timer's name before the rename
 WHEN = "Sun *-*-* 18:00:00"
 
 
@@ -35,18 +38,20 @@ def build(today: date | None = None) -> EmailMessage:
     held = [r for r in s["rows"] if r["status"] == "held"]
     span = f"{start:%d %b} – {today:%d %b %Y}"
 
-    lines = [f"Your Wellfound week, {span}", ""]
-    lines += [f"Applied this week:   {len(sent)}",
+    per_site = Counter(r["site"] for r in sent)
+    split = f" ({', '.join(f'{k} {v}' for k, v in per_site.items())})" if per_site else ""
+    lines = [f"Your job-hunt week, {span}", ""]
+    lines += [f"Applied this week:   {len(sent)}{split}",
               f"Applied in total:    {s['totals']['submitted']}",
               f"Skipped this week:   {len(skipped)}",
               f"Held for review:     {len(held)}",
               f"Drafted, not sent:   {len(pending)}",
-              f"Daily cap now:       {s['cap']['limit_today']} (max {s['cap_max']})"]
+              "Daily cap now:       " + ", ".join(f"{k} {c['limit_today']} (max {c['max']})" for k, c in s["caps"].items())]
 
     if sent:
         lines += ["", "Applications sent"]
         for r in sorted(sent, key=lambda r: r["updated_at"]):
-            lines += [f"  {r['updated_at'][:10]}  {r['title'] or r['job_id']} at {r['company'] or '?'}",
+            lines += [f"  {r['updated_at'][:10]}  [{r['site']}] {r['title'] or r['job_id']} at {r['company'] or '?'}",
                       f"              {r['url']}"]
     else:
         lines += ["", "No applications sent this week."]
@@ -68,11 +73,11 @@ def build(today: date | None = None) -> EmailMessage:
         lines += ["", "Why jobs were skipped"]
         lines += [f"  {n}× {why}" for why, n in sorted(reasons.items(), key=lambda kv: -kv[1])]
 
-    lines += ["", "Recruiter replies: https://wellfound.com/jobs/applications",
-              "Full stats: run `uv run wellfound-mcp-dashboard`", "", "Sent by wellfound-mcp."]
+    lines += ["", "Recruiter replies:"] + [f"  {k}: {u}" for k, u in s["applied_pages"].items()]
+    lines += ["Full stats: run `uv run hireloop-dashboard`", "", "Sent by hireloop."]
 
     msg = EmailMessage()
-    msg["Subject"] = f"[Wellfound] Weekly report: {len(sent)} applied ({span})"
+    msg["Subject"] = f"[Hireloop] Weekly report: {len(sent)} applied ({span})"
     msg["From"] = config.SMTP_USER
     msg["To"] = config.EMAIL_TO
     msg.set_content("\n".join(lines))
@@ -90,7 +95,7 @@ def send_weekly(force: bool = False, today: date | None = None) -> str:
     if not force and marker.exists() and marker.read_text().strip() == _week(today):
         return "already sent this week"
     if not notify.enabled():
-        return "off (set WELLFOUND_EMAIL_TO and WELLFOUND_SMTP_PASSWORD in .env)"
+        return notify.OFF
     try:
         notify.send(build(today))
     except Exception as e:  # noqa: BLE001
@@ -107,18 +112,19 @@ def _unit_dir() -> Path:
 
 
 def install() -> None:
+    _remove(OLD_UNIT)                          # replace the pre-rename timer, if any
     uv = shutil.which("uv") or "uv"
     d = _unit_dir()
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{UNIT}.service").write_text(f"""[Unit]
-Description=Wellfound MCP weekly email report
+Description=hireloop weekly email report
 
 [Service]
 Type=oneshot
-ExecStart={uv} run --directory {config.PROJECT_ROOT} wellfound-mcp-weekly-report
+ExecStart={uv} run --directory {config.PROJECT_ROOT} hireloop-weekly-report
 """)
     (d / f"{UNIT}.timer").write_text(f"""[Unit]
-Description=Send the Wellfound weekly report on Sundays
+Description=Send the hireloop weekly report on Sundays
 
 [Timer]
 OnCalendar={WHEN}
@@ -133,12 +139,19 @@ WantedBy=timers.target
     subprocess.run(["systemctl", "--user", "list-timers", f"{UNIT}.timer", "--no-pager"])
 
 
-def uninstall() -> None:
-    subprocess.run(["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"])
+def _remove(unit: str) -> bool:
+    if not (_unit_dir() / f"{unit}.timer").exists():
+        return False
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{unit}.timer"])
     for ext in ("service", "timer"):
-        (_unit_dir() / f"{UNIT}.{ext}").unlink(missing_ok=True)
+        (_unit_dir() / f"{unit}.{ext}").unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"])
-    print("Removed the weekly report timer.")
+    return True
+
+
+def uninstall() -> None:
+    removed = [u for u in (UNIT, OLD_UNIT) if _remove(u)]
+    print("Removed the weekly report timer." if removed else "No weekly report timer was installed.")
 
 
 def main() -> None:

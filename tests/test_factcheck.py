@@ -1,6 +1,6 @@
 """Fit rules and the fact check that gate automatic sending."""
 
-from wellfound_mcp import factcheck
+from hireloop import factcheck
 
 PROFILE = """- Name: Rohan R
 - GitHub: github.com/rohxn08
@@ -13,7 +13,7 @@ PROFILE = """- Name: Rohan R
 """
 JOB = {"title": "Data Analyst", "company": "Newton School", "salary": "₹4L – ₹8L", "locations": ["Bengaluru"],
        "stack": ["Excel"], "years": None, "remote": False, "hires_in": [], "visa": "Not available",
-       "apply_on_wellfound": True, "eligibility_issues": None, "description": "Fresher / 0–1 Year analytics role."}
+       "applies_on_site": True, "eligibility_issues": None, "description": "Fresher / 0–1 Year analytics role."}
 QS = [{"key": "1", "question": "What interests you about working for this company?", "required": False},
       {"key": "2", "question": "Your GitHub?", "required": True}]
 GOOD = ("Newton School's analytics role fits me. I analysed 144,867 trips in ZipRoute with Pandas and "
@@ -71,5 +71,27 @@ def test_fit_rules():
     assert not factcheck.fit({**JOB, "locations": ["Berlin"]})["ok"]
     assert factcheck.fit({**JOB, "locations": ["Berlin"], "visa": "Available"})["ok"]
     assert factcheck.fit({**JOB, "locations": ["Berlin"], "remote": True, "hires_in": ["India"]})["ok"]
-    assert not factcheck.fit({**JOB, "apply_on_wellfound": False})["ok"]
+    assert not factcheck.fit({**JOB, "applies_on_site": False})["ok"]
     assert not factcheck.fit({"error": "expired"})["ok"]
+
+
+def test_indeed_salary_formats():
+    lakhs = factcheck._max_lakhs
+    assert lakhs("₹4L – ₹8L") == 8
+    assert lakhs("₹6,00,000 - ₹9,00,000 a year") == 9
+    assert lakhs("₹25,000 - ₹30,000 a month") == 3.6
+    assert lakhs("Up to ₹500 an hour") == 10.4
+    assert lakhs("$100k") is None and lakhs(None) is None
+    low = {**JOB, "salary": "₹15,000 - ₹20,000 a month"}
+    assert any("₹2.4L" in r for r in factcheck.fit(low)["reasons"])
+
+
+def test_option_words_allowed():
+    qs = [{"key": "n", "question": "Notice period?", "required": True, "options": ["Immediately", "30 days"]}]
+    assert factcheck.check({"n": "Immediately"}, qs, PROFILE, JOB)["passed"]
+
+
+def test_any_indian_state_counts_as_india():
+    for loc in ("Jayanagar 7th Block, Karnataka", "Thane, Maharashtra", "Gurugram, Haryana", "Kochi, Kerala"):
+        assert factcheck.fit({**JOB, "locations": [loc]})["ok"], loc
+    assert not factcheck.fit({**JOB, "locations": ["Berlin, Germany"]})["ok"]
