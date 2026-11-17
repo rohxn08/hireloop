@@ -24,6 +24,12 @@ INDIA_PLACES = {
     "india", "bengaluru", "bangalore", "bangalore urban", "mumbai", "delhi", "new delhi", "gurugram",
     "gurgaon", "noida", "hyderabad", "chennai", "pune", "kolkata", "ahmedabad", "jaipur", "kochi",
     "chandigarh", "indore", "coimbatore", "thiruvananthapuram", "mysore", "mysuru", "gandhinagar",
+    # States and union territories: Indeed India lists "City, State" with no country.
+    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh", "goa", "gujarat", "haryana",
+    "himachal pradesh", "jharkhand", "karnataka", "kerala", "madhya pradesh", "maharashtra", "manipur",
+    "meghalaya", "mizoram", "nagaland", "odisha", "punjab", "rajasthan", "sikkim", "tamil nadu", "telangana",
+    "tripura", "uttar pradesh", "uttarakhand", "west bengal", "jammu and kashmir", "ladakh", "puducherry",
+    "andaman and nicobar", "dadra and nagar haveli", "daman and diu", "lakshadweep",
 }
 MAX_ANSWER_CHARS = 1500
 PLACEHOLDER = re.compile(r"\[[^\]]*\]|\{[^}]*\}|<[^>]*>|\bTODO\b|\bTBD\b|\bXXX\b|lorem ipsum", re.I)
@@ -53,12 +59,23 @@ def _years(value: Any) -> float | None:
     return float(m.group()) if m else None
 
 
+PER_YEAR = {"month": 12, "week": 52, "day": 260, "hour": 2080}
+
+
 def _max_lakhs(salary: str | None) -> float | None:
-    """Upper bound of an INR salary like '₹4L – ₹8L' in lakhs; None if not INR."""
+    """Upper bound of an INR salary in lakhs a year; None if not INR or unreadable.
+
+    Wellfound: '₹4L – ₹8L'. Indeed: '₹40,000 - ₹60,000 a month', '₹6,00,000 a year'.
+    """
     if not salary or "₹" not in salary:
         return None
-    vals = [float(x) for x in re.findall(r"₹\s*(\d+(?:\.\d+)?)\s*L", salary)]
-    return max(vals) if vals else None
+    if vals := [float(x) for x in re.findall(r"₹\s*(\d+(?:\.\d+)?)\s*L\b", salary)]:
+        return max(vals)
+    vals = [float(x.replace(",", "")) for x in re.findall(r"₹\s*(\d[\d,]*(?:\.\d+)?)", salary)]
+    if not vals:
+        return None
+    unit = re.search(r"\b(?:a|an|per|/)\s*(month|week|day|hour)", salary, re.I)
+    return max(vals) * (PER_YEAR[unit.group(1).lower()] if unit else 1) / 100_000
 
 
 def fit(job: dict[str, Any]) -> dict[str, Any]:
@@ -85,10 +102,12 @@ def fit(job: dict[str, Any]) -> dict[str, Any]:
     visa_ok = str(job.get("visa") or "").lower().startswith("available")
     if not (in_india or remote_ok or visa_ok):
         reasons.append("Outside India without visa sponsorship")
-    if job.get("apply_on_wellfound") is False:
+    if job.get("already_applied"):
+        reasons.append("Already applied")
+    if job.get("applies_on_site") is False:
         reasons.append("Applies on an external site")
     if job.get("eligibility_issues"):
-        reasons.append(f"Wellfound eligibility: {job['eligibility_issues']}")
+        reasons.append(f"Site eligibility: {job['eligibility_issues']}")
     return {"ok": not reasons, "reasons": reasons}
 
 
@@ -104,7 +123,9 @@ def check(answers: dict[str, str], questions: list[dict], profile_text: str, job
     """Verify every checkable claim in the answers against the profile and posting."""
     job_text = " ".join(str(job.get(k) or "") for k in ("title", "company", "description", "salary"))
     job_text += " " + " ".join(job.get("locations") or []) + " " + " ".join(job.get("stack") or [])
-    allowed = _norm(profile_text + " " + job_text + " " + " ".join(q["question"] for q in questions))
+    # Question text and offered options are fair game too ("Immediately", "Bachelor's").
+    form_text = " ".join(q["question"] + " " + " ".join(q.get("options") or []) for q in questions)
+    allowed = _norm(profile_text + " " + job_text + " " + form_text)
     profile_links = _norm(profile_text)
     # Links may point to the user's own pages (profile) or the employer's (posting).
     known_links = profile_links + " " + _norm(job_text)

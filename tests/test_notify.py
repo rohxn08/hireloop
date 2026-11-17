@@ -2,7 +2,7 @@
 
 import smtplib
 
-from wellfound_mcp import config, notify
+from hireloop import config, notify
 
 JOB = {"id": "5-ai", "title": "AI Engineer", "company": "Acme", "url": "https://wellfound.com/jobs/5-ai",
        "salary": "₹10L – ₹15L", "location": "Bengaluru"}
@@ -43,3 +43,11 @@ def test_failure_is_reported_not_raised(monkeypatch):
         raise smtplib.SMTPAuthenticationError(535, b"bad")
     monkeypatch.setattr(notify, "send", boom)
     assert "app password" in notify.application_sent(JOB, [])
+
+
+def test_indeed_subject(monkeypatch):
+    setup(monkeypatch)
+    job = {**JOB, "site": "Indeed", "applied_url": "https://myjobs.indeed.com/applied"}
+    msg = notify.build_message(job, [])
+    assert msg["Subject"] == "[Indeed] Applied: AI Engineer at Acme"
+    assert "on Indeed." in msg.get_content() and "myjobs.indeed.com/applied" in msg.get_content()

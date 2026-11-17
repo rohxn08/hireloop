@@ -1,6 +1,6 @@
 """Local, read-only dashboard over the application log.
 
-Run with: uv run wellfound-mcp-dashboard   (opens http://127.0.0.1:8765)
+Run with: uv run hireloop-dashboard   (opens http://127.0.0.1:8765)
 It only listens on 127.0.0.1, reads data/applications.db, and never changes it.
 """
 
@@ -13,10 +13,10 @@ from collections import Counter
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import config, store
+from . import config, sites, store
 
 DAYS = 30
-PORT = int(os.environ.get("WELLFOUND_DASHBOARD_PORT", "8765"))
+PORT = config.DASHBOARD_PORT
 
 
 def stats() -> dict:
@@ -34,7 +34,13 @@ def stats() -> dict:
     per_day = Counter(r["updated_at"][:10] for r in submitted)
     week_start = (today - timedelta(days=6)).isoformat()
     for r in rows:
-        r["url"] = r["url"] or f"{config.BASE_URL}/jobs/{r['job_id']}"
+        site = sites.of(r["job_id"])
+        r["site"] = site.LABEL
+        r["url"] = r["url"] or site.job_url(r["job_id"])
+    caps = {}
+    for name, site in sites.SITES.items():
+        cap = store.daily_limit(name) if config.DB_PATH.exists() else {"submitted_today": 0, "limit_today": store.caps(name)[0]}
+        caps[site.LABEL] = {**cap, "max": store.caps(name)[1]}
     return {
         "today": today.isoformat(),
         "totals": {
@@ -44,10 +50,14 @@ def stats() -> dict:
             "skipped": sum(r["status"] == "skipped" for r in rows),
             "held": sum(r["status"] == "held" for r in rows),
         },
-        "cap": store.daily_limit() if config.DB_PATH.exists() else {"submitted_today": 0, "limit_today": config.DAILY_START},
-        "cap_max": config.DAILY_MAX,
+        # Combined across sites, plus each site's own cap.
+        "cap": {"submitted_today": sum(c["submitted_today"] for c in caps.values()),
+                "limit_today": sum(c["limit_today"] for c in caps.values())},
+        "caps": caps,
+        "applied_pages": {s.LABEL: s.APPLIED_URL for s in sites.SITES.values()},
         "per_day": [{"day": (d := (today - timedelta(days=i)).isoformat()), "count": per_day.get(d, 0)}
                     for i in range(DAYS - 1, -1, -1)],
+        "by_site": dict(Counter(r["site"] for r in submitted)),
         "top_companies": Counter(r["company"] or "Unknown" for r in submitted).most_common(8),
         "skip_reasons": Counter((r["notes"] or "No reason given") for r in rows if r["status"] == "skipped").most_common(8),
         "rows": rows,
@@ -78,7 +88,7 @@ def main() -> None:
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError:
-        print(f"Port {PORT} is busy. Set WELLFOUND_DASHBOARD_PORT to another port.", file=sys.stderr)
+        print(f"Port {PORT} is busy. Set HIRELOOP_DASHBOARD_PORT to another port.", file=sys.stderr)
         sys.exit(1)
     url = f"http://127.0.0.1:{PORT}"
     print(f"Dashboard: {url}  (Ctrl+C to stop)")
@@ -95,7 +105,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wellfound Applications</title>
+<title>Hireloop Applications</title>
 <style>
 :root {
   color-scheme: light;
@@ -162,7 +172,7 @@ a { color: var(--link); }
 <body>
 <main>
   <header>
-    <h1>Wellfound applications</h1>
+    <h1>Job applications</h1>
     <span class="muted" id="updated"></span>
   </header>
 
@@ -181,30 +191,29 @@ a { color: var(--link); }
   <section class="card" style="margin-top:12px">
     <h2>All jobs</h2>
     <div class="filters" role="group" aria-label="Filter by status" id="filters"></div>
+    <div class="filters" role="group" aria-label="Filter by site" id="sitefilters"></div>
     <div class="tablewrap"><table>
-      <thead><tr><th>Date</th><th>Role</th><th>Company</th><th>Status</th><th>Note</th></tr></thead>
+      <thead><tr><th>Date</th><th>Site</th><th>Role</th><th>Company</th><th>Status</th><th>Note</th></tr></thead>
       <tbody id="rows"></tbody>
     </table></div>
   </section>
-  <p class="muted" style="margin-top:16px">Recruiter replies and application status live on
-    <a href="https://wellfound.com/jobs/applications" target="_blank" rel="noopener">Wellfound's Applied page</a>.
-    This page only knows what the MCP logged on this computer.</p>
+  <p class="muted" style="margin-top:16px" id="applied"></p>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtDay = (iso) => new Date(iso + "T00:00:00").toLocaleDateString(undefined, {day: "numeric", month: "short"});
-let data, filter = "all";
+let data, filter = "all", siteFilter = "all";
 
 function tiles(d) {
   const t = d.totals, cap = d.cap;
   const pct = Math.min(100, Math.round(100 * cap.submitted_today / Math.max(1, cap.limit_today)));
   $("tiles").innerHTML = `
     <div class="card tile"><div class="label">Applied in total</div><div class="value">${t.submitted}</div>
-      <div class="sub">${t.this_week} in the last 7 days</div></div>
+      <div class="sub">${t.this_week} in the last 7 days${Object.keys(d.by_site).length > 1 ? " · " + Object.entries(d.by_site).map(([s, n]) => `${esc(s)} ${n}`).join(", ") : ""}</div></div>
     <div class="card tile"><div class="label">Applied today</div><div class="value">${cap.submitted_today} <span class="muted" style="font-size:16px">of ${cap.limit_today}</span></div>
       <div class="meter" role="img" aria-label="${cap.submitted_today} of ${cap.limit_today} used today"><div style="width:${pct}%"></div></div>
-      <div class="sub">Cap rises by 1 per clean day, up to ${d.cap_max}</div></div>
+      <div class="sub">${Object.entries(d.caps).map(([s, c]) => `${esc(s)} ${c.submitted_today}/${c.limit_today} (max ${c.max})`).join(" · ")}</div></div>
     <div class="card tile"><div class="label">Held for your review</div><div class="value">${t.held}</div>
       <div class="sub">${t.drafted} more drafted, not sent</div></div>
     <div class="card tile"><div class="label">Skipped</div><div class="value">${t.skipped}</div>
@@ -261,14 +270,15 @@ function ranks(id, items, empty) {
 }
 
 function table() {
-  const rows = data.rows.filter(r => filter === "all" || r.status === filter);
+  const rows = data.rows.filter(r => (filter === "all" || r.status === filter) && (siteFilter === "all" || r.site === siteFilter));
   $("rows").innerHTML = rows.length ? rows.map(r => `<tr>
       <td class="date">${esc(r.updated_at.slice(0, 10))}</td>
+      <td>${esc(r.site)}</td>
       <td><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.job_id)}</a></td>
       <td>${esc(r.company)}</td>
       <td><span class="status ${esc(r.status)}">${esc(r.status)}</span></td>
       <td class="muted">${esc(r.notes)}</td></tr>`).join("")
-    : `<tr><td colspan="5" class="empty">Nothing here yet.</td></tr>`;
+    : `<tr><td colspan="6" class="empty">Nothing here yet.</td></tr>`;
 }
 
 function filters() {
@@ -277,6 +287,10 @@ function filters() {
   $("filters").innerHTML = ["all", "submitted", "held", "drafted", "skipped"].map(s =>
     `<button data-s="${s}" aria-pressed="${s === filter}">${s[0].toUpperCase() + s.slice(1)} (${counts[s] || 0})</button>`).join("");
   $("filters").onclick = e => { const b = e.target.closest("button"); if (!b) return; filter = b.dataset.s; filters(); table(); };
+  const names = ["all", ...Object.keys(data.caps)];
+  $("sitefilters").innerHTML = names.map(s =>
+    `<button data-s="${esc(s)}" aria-pressed="${s === siteFilter}">${s === "all" ? "All sites" : esc(s)} (${s === "all" ? data.rows.length : data.rows.filter(r => r.site === s).length})</button>`).join("");
+  $("sitefilters").onclick = e => { const b = e.target.closest("button"); if (!b) return; siteFilter = b.dataset.s; filters(); table(); };
 }
 
 fetch("/api/stats").then(r => r.json()).then(d => {
@@ -286,6 +300,9 @@ fetch("/api/stats").then(r => r.json()).then(d => {
   ranks("companies", d.top_companies, "No applications yet");
   ranks("reasons", d.skip_reasons, "Nothing skipped yet");
   filters(); table();
+  $("applied").innerHTML = "Recruiter replies and application status live on " +
+    Object.entries(d.applied_pages).map(([s, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(s)}'s Applied page</a>`).join(" and ") +
+    ". This page only knows what hireloop logged on this computer.";
 });
 </script>
 </body>

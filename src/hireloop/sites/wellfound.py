@@ -22,11 +22,18 @@ from datetime import date
 from typing import Any
 from urllib.parse import quote
 
-from . import config
-from .browser import Browser
+from ..browser import Browser
+from .common import DESCRIPTION_CHARS, ApplyError as _ApplyError, dedupe as _dedupe, json_ld, notice as _notice
+from .common import place as _place, summary as _summary, text as _text, trim as _trim
 
-DESCRIPTION_CHARS = 1500
-SUMMARY_CHARS = 140
+NAME = "wellfound"
+LABEL = "Wellfound"
+BASE_URL = "https://wellfound.com"
+LOGIN_URL = f"{BASE_URL}/login"
+CHECK_URL = f"{BASE_URL}/role/r/software-engineer"
+# URL fragments of the sign-in pages, so the login helper doesn't reload them while you type.
+LOGIN_PAGES = ("/login", "/signup", "/auth", "accounts.google")
+APPLIED_URL = f"{BASE_URL}/jobs/applications"
 PER_PAGE = 20
 
 
@@ -36,31 +43,13 @@ def _slug(text: str) -> str:
     return quote(re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-"))
 
 
-def _text(fragment: str) -> str:
-    """HTML fragment -> plain text with paragraph breaks kept."""
-    s = re.sub(r"<(br|/p|/li|/h\d|/div)[^>]*>", "\n", fragment, flags=re.I)
-    s = re.sub(r"<li[^>]*>", "• ", s, flags=re.I)
-    s = htmllib.unescape(re.sub(r"<[^>]+>", "", s))
-    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
-    s = re.sub(r"[ \t\xa0]+", " ", s)
-    return re.sub(r"\n\s*\n+", "\n", s).strip()
+def owns(job_id: str) -> bool:
+    """Wellfound ids are '<number>-<slug>', with no site prefix."""
+    return bool(re.fullmatch(r"\d+-[a-z0-9-]+", job_id))
 
 
-def _trim(text: str, n: int) -> str:
-    return text if len(text) <= n else text[: n - 1].rsplit(" ", 1)[0] + "…"
-
-
-def _summary(desc: str) -> str | None:
-    """First real sentence of a description, skipping headings like 'About Us'."""
-    for line in desc.split("\n"):
-        line = re.sub(r"[#*_`>]+", "", line).strip(" •-:")
-        if len(line) >= 40:
-            return _trim(line, SUMMARY_CHARS)
-    return None
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    return list(dict.fromkeys(items))
+def job_url(job_id: str) -> str:
+    return f"{BASE_URL}/jobs/{job_id}"
 
 
 def _next_data(page_html: str) -> dict[str, Any] | None:
@@ -91,22 +80,28 @@ def parse_logged_in(page_html: str) -> bool | None:
 
 
 async def is_logged_in(browser: Browser) -> bool:
-    page = await browser.goto(f"{config.BASE_URL}/role/r/software-engineer")
+    page = await browser.goto(CHECK_URL)
     if "/login" in page.url:
         return False
     found = parse_logged_in(await page.content())
     return bool(found)
 
 
+async def logged_in_on(tab) -> bool:
+    """Login helper's check, in a background tab and without the human-speed pauses."""
+    await tab.goto(CHECK_URL, wait_until="domcontentloaded")
+    return bool(parse_logged_in(await tab.content()))
+
+
 # ---------- search ----------
 
 def search_url(role: str, location: str | None, remote: bool, page: int = 1) -> str:
     if remote:
-        url = f"{config.BASE_URL}/role/r/{_slug(role)}"
+        url = f"{BASE_URL}/role/r/{_slug(role)}"
     elif location:
-        url = f"{config.BASE_URL}/role/l/{_slug(role)}/{_slug(location)}"
+        url = f"{BASE_URL}/role/l/{_slug(role)}/{_slug(location)}"
     else:
-        url = f"{config.BASE_URL}/role/{_slug(role)}"
+        url = f"{BASE_URL}/role/{_slug(role)}"
     return url if page == 1 else f"{url}?page={page}"
 
 
@@ -156,17 +151,6 @@ async def search_jobs(browser: Browser, role: str, location: str | None, remote:
 
 # ---------- job detail ----------
 
-def _json_ld(page_html: str) -> dict[str, Any] | None:
-    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', page_html, re.S):
-        try:
-            d = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(d, dict) and d.get("@type") == "JobPosting":
-            return d
-    return None
-
-
 def _labeled(page_html: str, label: str) -> str | None:
     """Text of the small 'Label / value' blocks in the job sidebar."""
     m = re.search(rf'font-semibold">{re.escape(label)}</span>(.*?)</div>', page_html, re.S)
@@ -183,14 +167,9 @@ def _salary_ld(d: dict[str, Any]) -> str | None:
     return f"{b.get('currency', '')} {rng} / {str(v.get('unitText', 'year')).lower()}".strip()
 
 
-def _place(p: dict[str, Any]) -> str:
-    a = p.get("address") or {}
-    return ", ".join(x for x in (a.get("addressLocality"), a.get("addressCountry")) if x)
-
-
 def _parse_job_ld(page_html: str, job_id: str) -> dict[str, Any] | None:
     """Logged-out job page: schema.org JSON-LD plus the sidebar."""
-    d = _json_ld(page_html)
+    d = json_ld(page_html)
     if not d:
         return None
 
@@ -204,7 +183,7 @@ def _parse_job_ld(page_html: str, job_id: str) -> dict[str, Any] | None:
         "id": job_id,
         "title": d.get("title"),
         "company": (d.get("hiringOrganization") or {}).get("name"),
-        "url": f"{config.BASE_URL}/jobs/{job_id}",
+        "url": job_url(job_id),
         # The header text includes equity ("$150k – $180k • 0.5% – 1.0%"); JSON-LD doesn't.
         "salary": comp if re.search(r"\d", comp) else _salary_ld(d),
         "type": d.get("employmentType"),
@@ -217,7 +196,7 @@ def _parse_job_ld(page_html: str, job_id: str) -> dict[str, Any] | None:
         "relocation": _labeled(page_html, "Relocation"),
         "stack": skills,
         "posted": (d.get("datePosted") or "")[:10] or None,
-        "apply_on_wellfound": d.get("directApply"),
+        "applies_on_site": d.get("directApply"),
         "description": _trim(_text(d.get("description") or ""), DESCRIPTION_CHARS),
     }
 
@@ -243,7 +222,7 @@ def _parse_job_apollo(page_html: str, job_id: str) -> dict[str, Any] | None:
         "id": job_id,
         "title": j.get("title"),
         "company": deref(j.get("startup")).get("name", "").strip() or None,
-        "url": f"{config.BASE_URL}/jobs/{job_id}",
+        "url": job_url(job_id),
         "salary": htmllib.unescape(j.get("compensation") or "") or None,
         "type": j.get("jobType"),
         "remote": j.get("remote"),
@@ -255,7 +234,7 @@ def _parse_job_apollo(page_html: str, job_id: str) -> dict[str, Any] | None:
         "relocation": "Allowed" if j.get("allowRelocation") else "Not allowed",
         "stack": [t.get("displayName") for t in map(deref, j.get("skills") or []) if t.get("displayName")],
         "posted": date.fromtimestamp(started).isoformat() if started else None,
-        "apply_on_wellfound": j.get("source") == "PLATFORM" if j.get("source") else None,
+        "applies_on_site": j.get("source") == "PLATFORM" if j.get("source") else None,
         # Wellfound's own eligibility check for this user; non-empty means it may block applying.
         "eligibility_issues": [str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in issues] or None,
         "description": _trim(_text(desc), DESCRIPTION_CHARS),
@@ -268,9 +247,9 @@ def parse_job(page_html: str, job_id: str) -> dict[str, Any]:
 
 
 async def get_job(browser: Browser, job_id: str) -> dict[str, Any]:
-    if not re.fullmatch(r"\d+-[a-z0-9-]+", job_id):
+    if not owns(job_id):
         return {"error": "job_id must be the full id from search_jobs, like '4417481-software-engineer'."}
-    page = await browser.goto(f"{config.BASE_URL}/jobs/{job_id}")
+    page = await browser.goto(job_url(job_id))
     if browser.last_status == 410:
         return {"error": "This job has expired.", "id": job_id}
     if browser.last_status == 404:
@@ -329,31 +308,17 @@ def parse_application(page_html: str) -> dict[str, Any] | None:
 # these words, since its exact wording hasn't been seen yet.
 LIMIT_WORDS = re.compile(r"maximum|limit|too many|active (job )?applications", re.I)
 
-NOTICE_JS = """() => [...document.querySelectorAll(
-  '[role=dialog], [role=alert], [role=status], .ReactModal__Content, [class*=flash], [class*=toast], [class*=Toast], [class*=fieldError]')]
-  .map(e => e.innerText.trim()).filter(Boolean).join(' | ').slice(0, 500)"""
-
-
-class ApplyError(Exception):
+class ApplyError(_ApplyError):
     def __init__(self, message: str, notice: str | None = None) -> None:
-        self.notice = notice or None
+        super().__init__(message, notice)
         self.limit_reached = bool(notice and LIMIT_WORDS.search(notice))
         if self.limit_reached:
-            message = ("Wellfound's limit on active applications seems to be reached. "
-                       "Slots free up as older applications expire.")
-        super().__init__(message)
-
-
-async def _notice(page) -> str | None:
-    """Whatever Wellfound is showing in dialogs, alerts or toasts, for error messages."""
-    try:
-        return await page.evaluate(NOTICE_JS) or None
-    except Exception:
-        return None
+            self.args = ("Wellfound's limit on active applications seems to be reached. "
+                         "Slots free up as older applications expire.",)
 
 
 async def _open_application(browser: Browser, job_id: str):
-    page = await browser.goto(f"{config.BASE_URL}/jobs/{job_id}?autoOpenApplication=true")
+    page = await browser.goto(f"{BASE_URL}/jobs/{job_id}?autoOpenApplication=true")
     if browser.last_status in (404, 410):
         raise ApplyError("This job has expired or doesn't exist.")
     try:
@@ -381,9 +346,6 @@ async def application_questions(browser: Browser, job_id: str) -> dict[str, Any]
 # After "Send application", Wellfound lists the application as "Scheduled" with
 # an "Undo · m:ss" countdown (5 minutes, seen Nov 2026); only then is it
 # delivered to the company and shown as "Pending".
-
-APPLIED_URL = f"{config.BASE_URL}/jobs/applications"
-
 
 def parse_scheduled(page_text: str) -> list[int]:
     """Seconds left on each still-scheduled application's undo window."""

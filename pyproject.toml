@@ -1,7 +1,7 @@
 [project]
-name = "wellfound-mcp"
-version = "0.1.0"
-description = "A small, token-lean MCP server for finding and applying to jobs on Wellfound, with human approval before every submission."
+name = "hireloop"
+version = "0.2.0"
+description = "A small, token-lean MCP server that finds and applies to jobs on Wellfound and Indeed, with fact-checked answers and human-speed browsing."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
@@ -10,18 +10,20 @@ dependencies = [
 ]
 
 [project.scripts]
-wellfound-mcp = "wellfound_mcp.server:main"
-wellfound-mcp-login = "wellfound_mcp.login:main"
-wellfound-mcp-test-email = "wellfound_mcp.notify:test_main"
-wellfound-mcp-dashboard = "wellfound_mcp.dashboard:main"
-wellfound-mcp-weekly-report = "wellfound_mcp.weekly:main"
+hireloop = "hireloop.server:main"
+hireloop-login = "hireloop.login:main"
+hireloop-test-email = "hireloop.notify:test_main"
+hireloop-dashboard = "hireloop.dashboard:main"
+hireloop-weekly-report = "hireloop.weekly:main"
+# Old name, so an MCP registered before the rename keeps starting.
+wellfound-mcp = "hireloop.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/wellfound_mcp"]
+packages = ["src/hireloop"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

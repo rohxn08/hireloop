@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from wellfound_mcp import config, notify, store, weekly
+from hireloop import config, notify, store, weekly
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +21,7 @@ def test_report_content():
     store.record("2-sw", "skipped", title="SWE", company="Beta", notes="Needs 5+ years")
     store.record("3-cv", "drafted", title="CV Engineer", company="Gamma")
     msg = weekly.build()
-    assert msg["Subject"].startswith("[Wellfound] Weekly report: 1 applied")
+    assert msg["Subject"].startswith("[Hireloop] Weekly report: 1 applied")
     body = msg.get_content()
     assert "AI Engineer at Acme" in body and "https://wellfound.com/jobs/1-ai" in body
     assert "1× Needs 5+ years" in body and "CV Engineer at Gamma" in body
